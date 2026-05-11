@@ -1,0 +1,295 @@
+// ============================================================
+//  16-bit BFloat16 Arithmetic Unit — Basys3 FPGA
+//  Supports: Addition, Subtraction, Multiplication
+//  Format: BFloat16 (1 sign | 8 exponent | 7 mantissa)
+// ============================================================
+
+
+// ------------------------------------------------------------
+//  MODULE 1: TOP MODULE (I/O, Register Loading, Edge Detection)
+// ------------------------------------------------------------
+module top_module (clk, rst, btn_load_a, btn_load_b, sum, sub, sw, led);
+    input clk, rst, btn_load_a, btn_load_b, sum, sub;
+    input [15:0] sw;
+    output [15:0] led;
+
+    reg [15:0] reg_a = 0;
+    reg [15:0] reg_b = 0;
+    wire [15:0] o_res;
+
+    always @(posedge clk) begin
+        if (rst)             reg_a <= 16'd0;
+        else if (btn_load_a) reg_a <= sw;
+    end
+
+    always @(posedge clk) begin
+        if (rst)             reg_b <= 16'd0;
+        else if (btn_load_b) reg_b <= sw;
+    end
+
+    // Rising-edge detection for sum
+    reg sum_prev = 0;
+    wire sum_w;
+    always @(posedge clk) sum_prev <= sum;
+    assign sum_w = sum & ~sum_prev;
+
+    // Rising-edge detection for sub
+    reg sub_prev = 0;
+    wire sub_w;
+    always @(posedge clk) sub_prev <= sub;
+    assign sub_w = sub & ~sub_prev;
+
+    // Rising-edge detection for mul (via sw[15])
+    reg mul_prev = 0;
+    wire mul_w;
+    always @(posedge clk) mul_prev <= sw[15];
+    assign mul_w = sw[15] & ~mul_prev & ~btn_load_a & ~btn_load_b;
+
+    main uut (
+        .clk(clk),
+        .rst(rst),
+        .i_a(reg_a),
+        .i_b(reg_b),
+        .sub(sub_w),
+        .sum(sum_w),
+        .mul(mul_w),
+        .o_res(o_res)
+    );
+
+    assign led = o_res;
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 2: MAIN (Arithmetic Dispatcher)
+// ------------------------------------------------------------
+module main (clk, rst, i_a, i_b, sub, sum, mul, o_res);
+    input clk, rst;
+    input [15:0] i_a, i_b;
+    input sub, sum, mul;
+    output reg [15:0] o_res;
+
+    wire [9:0]  mantissa_a, mantissa_b;
+    wire [9:0]  mantissa_1, mantissa_2;
+    wire [10:0] mantissa_sum;
+    wire [7:0]  mantissa_final;
+    wire [7:0]  exponent_final;
+    wire        sign_res;
+    wire        exception_a, exception_b, zero_a, zero_b;
+    wire [15:0] a, b;
+    wire [15:0] res;
+    wire [15:0] res_mul;
+
+    assign a = i_a;
+    assign b = (sub) ? {~i_b[15], i_b[14:0]} : {i_b[15], i_b[14:0]};
+
+    // Multiplier instance
+    bfloat_mul multiplier (
+        .a(i_a),
+        .b(i_b),
+        .res(res_mul)
+    );
+
+    always @(posedge clk) begin
+        if (rst)       o_res <= 16'd0;
+        else if (mul)  o_res <= res_mul;
+        else if (sum || sub) o_res <= res;
+    end
+
+    // Special value detection
+    assign exception_a = (&a[14:7]);
+    assign exception_b = (&b[14:7]);
+    assign zero_a      = !(|a[14:0]);
+    assign zero_b      = !(|b[14:0]);
+
+    // Mantissa reconstruction (implicit leading 1 for normalized)
+    assign mantissa_a = ((|a[14:7]) ? {3'b001, a[6:0]} : {3'b000, a[6:0]});
+    assign mantissa_b = ((|b[14:7]) ? {3'b001, b[6:0]} : {3'b000, b[6:0]});
+
+    wire [7:0] exponent_res;
+
+    // Adder/subtractor pipeline
+    compare_and_shift cas (mantissa_a, mantissa_b, a[14:7], b[14:7], exponent_res, mantissa_1, mantissa_2);
+    addition          add (a[15], b[15], mantissa_1, mantissa_2, mantissa_sum);
+    normalisation    norm (a[7], b[7], mantissa_sum, exponent_res, mantissa_final, exponent_final, sign_res);
+
+    // Result mux with special-value priority
+    assign res = exception_a ? {a[15], 8'b11111111, 7'b0} :
+                 exception_b ? {b[15], 8'b11111111, 7'b0} :
+                 zero_a      ? b :
+                 zero_b      ? a :
+                 {sign_res, exponent_final, mantissa_final[6:0]};
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 3: BFLOAT MULTIPLIER (Top-Level)
+// ------------------------------------------------------------
+module bfloat_mul (
+    input  [15:0] a, b,
+    output [15:0] res
+);
+    wire        sign_res;
+    wire [7:0]  exp_a, exp_b, exp_sum;
+    wire [9:0]  mant_a, mant_b;
+    wire [19:0] mant_product;
+    wire [7:0]  mant_final, exp_final;
+    wire        exception_a, exception_b, zero_a, zero_b;
+
+    assign exception_a = &a[14:7];
+    assign exception_b = &b[14:7];
+    assign zero_a      = !(|a[14:0]);
+    assign zero_b      = !(|b[14:0]);
+
+    assign sign_res = a[15] ^ b[15];
+
+    assign exp_a    = a[14:7];
+    assign exp_b    = b[14:7];
+    assign exp_sum  = exp_a + exp_b - 8'd127;
+
+    assign mant_a = (|exp_a) ? {3'b001, a[6:0]} : {3'b000, a[6:0]};
+    assign mant_b = (|exp_b) ? {3'b001, b[6:0]} : {3'b000, b[6:0]};
+
+    multiply_mantissa mul (
+        .mantissa_a(mant_a),
+        .mantissa_b(mant_b),
+        .mantissa_product(mant_product)
+    );
+
+    normalisation_mul norm (
+        .mantissa_product(mant_product),
+        .exponent_sum(exp_sum),
+        .mantissa_final(mant_final),
+        .exponent_final(exp_final)
+    );
+
+    assign res = exception_a ? {sign_res, 8'hFF, 7'b0} :
+                 exception_b ? {sign_res, 8'hFF, 7'b0} :
+                 zero_a      ? 16'b0 :
+                 zero_b      ? 16'b0 :
+                 {sign_res, exp_final, mant_final[6:0]};
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 4: MULTIPLY MANTISSA
+// ------------------------------------------------------------
+module multiply_mantissa (
+    input  [9:0]  mantissa_a,
+    input  [9:0]  mantissa_b,
+    output [19:0] mantissa_product
+);
+    assign mantissa_product = mantissa_a * mantissa_b;
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 5: NORMALISATION (Multiplier)
+// ------------------------------------------------------------
+module normalisation_mul (
+    input  [19:0] mantissa_product,
+    input  [7:0]  exponent_sum,
+    output reg [7:0] mantissa_final,
+    output reg [7:0] exponent_final
+);
+    integer i;
+    always @(*) begin
+        if (mantissa_product == 0) begin
+            mantissa_final = 0;
+            exponent_final = 0;
+        end
+        else if (mantissa_product[15] == 1) begin
+            mantissa_final = mantissa_product[15:8];
+            exponent_final = exponent_sum + 1;
+        end
+        else begin
+            mantissa_final = mantissa_product[14:7];
+            exponent_final = exponent_sum;
+            for (i = 0; i < 8; i = i + 1) begin
+                if (mantissa_final[7] == 0) begin
+                    mantissa_final = mantissa_final << 1;
+                    exponent_final = exponent_final - 1;
+                end
+            end
+        end
+    end
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 6: COMPARE AND SHIFT (Exponent Alignment)
+// ------------------------------------------------------------
+module compare_and_shift (
+    input  [9:0] mantissa_a, mantissa_b,
+    input  [7:0] ein_a, ein_b,
+    output reg [7:0] exponent_res,
+    output reg [9:0] mantissa_1, mantissa_2
+);
+    always @(*) begin
+        if (ein_a == ein_b) begin
+            mantissa_1   = mantissa_a;
+            mantissa_2   = mantissa_b;
+            exponent_res = ein_a + 1'b1;
+        end
+        else if (ein_a > ein_b) begin
+            mantissa_1   = mantissa_a;
+            mantissa_2   = (mantissa_b >> (ein_a - ein_b));
+            exponent_res = ein_a + 1'b1;
+        end
+        else begin
+            mantissa_1   = (mantissa_a >> (ein_b - ein_a));
+            mantissa_2   = mantissa_b;
+            exponent_res = ein_b + 1'b1;
+        end
+    end
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 7: ADDITION (Signed Mantissa Add)
+// ------------------------------------------------------------
+module addition (
+    input        signa, signb,
+    input  [9:0] mantissa_1, mantissa_2,
+    output [10:0] mantissa_sum
+);
+    wire [9:0] Mantissa_1, Mantissa_2;
+    assign Mantissa_1   = (signa ? (-mantissa_1) : mantissa_1);
+    assign Mantissa_2   = (signb ? (-mantissa_2) : mantissa_2);
+    assign mantissa_sum = Mantissa_1 + Mantissa_2;
+endmodule
+
+
+// ------------------------------------------------------------
+//  MODULE 8: NORMALISATION (Adder)
+// ------------------------------------------------------------
+module normalisation (
+    input        signa_int, signb_int,
+    input  [10:0] mantissa_sum,
+    input  [7:0]  exponent_res,
+    output reg [7:0] mantissa_final,
+    output reg [7:0] exponent_final,
+    output           sign_res
+);
+    wire [10:0] Mantissa_sum;
+    assign sign_res    = mantissa_sum[9];
+    assign Mantissa_sum = (mantissa_sum[9] ? (-mantissa_sum) : mantissa_sum);
+
+    integer i;
+    always @(*) begin
+        if (Mantissa_sum[9:0] == 10'b0) begin
+            mantissa_final = 8'b0;
+            exponent_final = 8'b0;
+        end
+        else begin
+            mantissa_final = Mantissa_sum[8:1];
+            exponent_final = exponent_res;
+            for (i = 0; i < 8; i = i + 1) begin
+                if (mantissa_final[7] == 0) begin
+                    mantissa_final = (mantissa_final << 1'b1);
+                    exponent_final = exponent_final - 1'b1;
+                end
+            end
+        end
+    end
+endmodule
